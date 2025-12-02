@@ -1,0 +1,95 @@
+create or replace procedure "LOAD_POLICY_DETAILS" (
+    in_doc_id    in number,
+    in_topn      in     number,
+    prompt_id      in     number,
+    profile_name in varchar2
+)
+as
+    messages            CLOB;
+    params              CLOB;
+    output              CLOB;
+    message_line        VARCHAR2(4000);
+    message_cursor      SYS_REFCURSOR;
+    user_question_vec   vector;
+    pages_1             varchar2(4000);
+    embed_id            number ;
+    detail_id           number;
+    l_pd_version        number;
+
+begin
+  
+   OPEN message_cursor 
+    FOR SELECT  EMBED_DATA, embed_id
+     FROM VECTOR_STORE
+     WHERE doc_id = in_doc_id
+     FETCH FIRST in_topn ROWS ONLY; 
+
+  -- Initialize messages CLOB
+    select text into messages from prompts where id = prompt_id;
+    pages_1  := '--';
+
+  -- Loop through cursor results and construct messages
+    LOOP
+        FETCH message_cursor INTO message_line,embed_id;
+        EXIT WHEN message_cursor%notfound;
+
+    -- Append message line to messages CLOB
+        messages := messages|| '{"message": "'|| message_line|| '"},'|| chr(10);
+        pages_1 := embed_id||','||pages_1;
+
+    END LOOP;
+
+  -- Close the cursor
+    CLOSE message_cursor;
+
+  -- Remove the trailing comma and newline character
+    messages := rtrim(messages, ',' || chr(10));
+
+
+    dbms_output.put_line('------------------------');
+   -- dbms_output.put_line(messages);
+    dbms_output.put_line(pages_1);
+  --dbms_output.put_line(to_char(user_question_vec));
+
+  -- Call UTL function to generate text
+  --output := dbms_vector_chain.utl_to_generate_text(messages, json(params));
+  
+  --find pd_version number for nest entry
+  select max(nvl(pd_version, 0))+1 into l_pd_version from policy_details where POLICY_ID = in_doc_id;
+
+  output := DBMS_CLOUD_AI.GENERATE(prompt       => messages,
+                              profile_name => profile_name,
+                              action       => 'chat');
+
+
+    insert into policy_details (POLICY_ID,POLICY_NUMBER, POLICY_NAME, EFFECTIVE_DATE, LAST_REVIEWED_DATE, LAST_REVISED_DATE, NEXT_REVIEW_DATE, PAYOR, APPROVAL_DATE, PUBLISHED_DATE, VERSION, DOCUMENT_TYPE,URL, pd_version )
+        SELECT *
+            FROM   (select in_doc_id as POLICY_ID from dual), 
+                    JSON_TABLE(output, '$'
+                    COLUMNS(
+                        POLICY_NUMBER varchar2(500) path '$."Policy Number"',
+                        POLICY_NAME VARCHAR2(500) PATH '$."Policy Name"',
+	                    EFFECTIVE_DATE DATE path '$."Effective Date"',
+                        "LAST_REVIEWED_DATE" DATE path '$."Last Reviewed Date"',
+                        "LAST_REVISED_DATE" DATE path '$."Last Revised Date"',
+                        "NEXT_REVIEW_DATE" DATE path '$."Next Review Date"',
+                        "PAYOR" VARCHAR2(500) path '$.Payor',
+                        "APPROVAL_DATE" DATE path '$."Approval Date"',
+                        "PUBLISHED_DATE" DATE path '$."Published Date"',
+                        "VERSION" VARCHAR2(500) path '$.Version',
+                        "DOCUMENT_TYPE" VARCHAR2(500) path '$."Document Type"',
+                        "URL" VARCHAR2(2000) path '$.URL'),
+                        l_pd_version
+                  );
+    -- enter the procedure code here
+select max(id) into detail_id from policy_details;
+
+  insert into billing(POLICY_NUMBER, code, description)
+  SELECT *
+    FROM  (select detail_id as POLICY_ID from dual), JSON_TABLE(output
+         , '$."Billing"[*
+            ]'
+                       COLUMNS (code varchar2(50) path '$.code' , description varchar2(4000) path '$.description' )
+                     );
+End "LOAD_POLICY_DETAILS";
+/
